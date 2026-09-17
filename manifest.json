@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "CursorQuota",
+  "version": "1.0.0",
+  "description": "Adds daily quota budgets and reset-date projections to Cursor's dashboard.",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": ["https://cursor.com/dashboard/*"],
+  "action": { "default_title": "Cursor Quota Pace", "default_popup": "popup.html" },
+  "content_scripts": [
+    {
+      "matches": ["https://cursor.com/dashboard/spending*"],
+      "js": ["content.js"],
+      "css": ["quota-pace.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

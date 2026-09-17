@@ -1,0 +1,12 @@
+#cursor-quota-pace { margin: 0 0 24px; border: 1px solid var(--border-quaternary, #303036); border-radius: 12px; background: var(--bg-elevated, #1d1d21); color: var(--text-primary, #f4f4f5); overflow: hidden; }
+.cqp-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px; border-bottom: 1px solid var(--border-quaternary, #303036); }
+.cqp-eyebrow { margin: 0 0 4px; color: var(--text-tertiary, #96969f); font-size: 11px; font-weight: 700; letter-spacing: .08em; }
+.cqp-header h2, .cqp-meter h3 { margin: 0; font-size: 16px; }
+.cqp-subtitle, .cqp-meter p { margin: 4px 0 0; color: var(--text-secondary, #b1b1b8); font-size: 13px; }
+.cqp-legend { padding: 12px 20px 0; color: var(--text-tertiary, #96969f); font-size: 12px; display: flex; align-items: center; gap: 7px; }
+.cqp-key { display: inline-block; width: 18px; height: 2px; margin-left: 8px; }.cqp-key.actual { background:#69a8ff; }.cqp-key.ideal { border-top: 2px dashed #8e8e99; }.cqp-key.projected { border-top: 2px dashed #d4a452; }
+.cqp-meters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; margin-top: 12px; background: var(--border-quaternary, #303036); }
+.cqp-meter { padding: 18px 20px 14px; background: var(--bg-elevated, #1d1d21); min-width: 0; }.cqp-meter-head { display:flex; justify-content:space-between; gap:12px; }.cqp-good { color:#59bd88; }.cqp-warning { color:#ed9b5d; }
+.cqp-stats { display:flex; flex-wrap:wrap; gap: 6px 16px; margin: 16px 0 2px; color:var(--text-secondary, #b1b1b8); font-size:12px; }.cqp-stats b { color:var(--text-primary, #f4f4f5); font-size:13px; }
+.cqp-chart { display:block; width:100%; height:auto; overflow:visible; }.cqp-chart text { fill:var(--text-tertiary, #96969f); font-size:11px; }.cqp-grid path { stroke:var(--border-quaternary, #303036); stroke-width:1; }.cqp-ideal { fill:none; stroke:#8e8e99; stroke-width:1.5; stroke-dasharray:4 4; }.cqp-actual { fill:none; stroke:#69a8ff; stroke-width:2.5; stroke-linecap:round; stroke-linejoin:round; }.cqp-projection { fill:none; stroke:#d4a452; stroke-width:2.5; stroke-dasharray:6 4; }.cqp-projection.is-risk { stroke:#e66d5a; }.cqp-dot { fill:#69a8ff; stroke:var(--bg-elevated, #1d1d21); stroke-width:2; }
+@media (max-width: 720px) { .cqp-header { align-items:flex-start; flex-direction:column; }.cqp-meters { grid-template-columns:1fr; } }
