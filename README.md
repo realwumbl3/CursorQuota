@@ -9,7 +9,7 @@ On the Cursor **Spending** page, it adds a quota chart for Cursor Models and Oth
 - ideal pace to reach the reset date
 - projected usage at reset
 
-The projection updates automatically whenever the Spending page loads.
+Every visit to the Spending page records the displayed percentage. Each chart spans the current billing period—from its start through the reset date—and projects forward from the latest point.
 
 ## Install
 

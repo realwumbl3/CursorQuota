@@ -4,6 +4,7 @@
   let lastPath = "";
   let renderTimer;
   let activeRender = false;
+  let spendingVisitCaptured = false;
 
   const getStore = () => new Promise((resolve) => chrome.storage.local.get(STORAGE_KEY, (value) => resolve(value[STORAGE_KEY] || { snapshots: {} })));
   const setStore = (store) => new Promise((resolve) => chrome.storage.local.set({ [STORAGE_KEY]: store }, resolve));
@@ -48,14 +49,16 @@
     if (!parsed) return false;
     const store = await getStore();
     const now = new Date();
-    const today = now.toISOString().slice(0, 10);
+    const capturedAt = spendingVisitCaptured ? (store.latest?.capturedAt || now.toISOString()) : now.toISOString();
+    const oldestAllowed = now.getTime() - 30 * 24 * 60 * 60 * 1000;
     const snapshots = store.snapshots || {};
     for (const [name, used] of Object.entries(parsed.meters)) {
-      const entries = (snapshots[name] || []).filter((entry) => entry.resetAt === parsed.resetAt && entry.date !== today);
-      entries.push({ date: today, capturedAt: now.toISOString(), used, daysLeft: parsed.daysLeft, resetAt: parsed.resetAt });
-      snapshots[name] = entries.slice(-45);
+      const entries = (snapshots[name] || []).filter((entry) => new Date(entry.capturedAt).getTime() >= oldestAllowed);
+      if (!spendingVisitCaptured) entries.push({ capturedAt, used, daysLeft: parsed.daysLeft, resetAt: parsed.resetAt });
+      snapshots[name] = entries;
     }
-    await setStore({ snapshots, latest: { ...parsed, capturedAt: now.toISOString() } });
+    await setStore({ snapshots, latest: { ...parsed, capturedAt } });
+    spendingVisitCaptured = true;
     return true;
   }
 
@@ -76,14 +79,24 @@
     const m = metrics(latest, name);
     const width = 760, height = 190, pad = { left: 34, right: 18, top: 18, bottom: 30 };
     const chartW = width - pad.left - pad.right, chartH = height - pad.top - pad.bottom;
-    const elapsed = Math.max(1, CYCLE_DAYS - latest.daysLeft);
-    const x = (day) => pad.left + (day / CYCLE_DAYS) * chartW;
+    const now = new Date(latest.capturedAt).getTime();
+    const resetAt = Math.max(now + 1, new Date(latest.resetAt).getTime());
+    const billingStart = resetAt - CYCLE_DAYS * 24 * 60 * 60 * 1000;
+    const x = (time) => pad.left + (Math.max(billingStart, Math.min(resetAt, time)) - billingStart) / (resetAt - billingStart) * chartW;
     const y = (value) => pad.top + chartH - (Math.min(120, Math.max(0, value)) / 120) * chartH;
-    const actual = history.map((entry) => ({ day: Math.max(0, CYCLE_DAYS - entry.daysLeft), used: entry.used }));
-    if (!actual.length || actual.at(-1).day !== elapsed) actual.push({ day: elapsed, used: m.used });
-    const actualPath = actual.map((point, index) => `${index ? "L" : "M"}${x(point.day).toFixed(1)},${y(point.used).toFixed(1)}`).join(" ");
-    const projectedPath = `M${x(elapsed).toFixed(1)},${y(m.used).toFixed(1)} L${x(CYCLE_DAYS).toFixed(1)},${y(m.projected).toFixed(1)}`;
-    return `<svg class="cqp-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${name} quota projection"><g class="cqp-grid"><path d="M${pad.left},${y(100)}H${width-pad.right} M${pad.left},${y(50)}H${width-pad.right} M${pad.left},${y(0)}H${width-pad.right}"/></g><path class="cqp-ideal" d="M${x(0)},${y(0)} L${x(CYCLE_DAYS)},${y(100)}"/><path class="cqp-actual" d="${actualPath}"/><path class="cqp-projection ${m.projected > 100 ? "is-risk" : ""}" d="${projectedPath}"/><circle class="cqp-dot" cx="${x(elapsed)}" cy="${y(m.used)}" r="4"/><text x="${pad.left}" y="${height - 8}">Start</text><text x="${x(elapsed)}" y="${height - 8}" text-anchor="middle">Today</text><text x="${width-pad.right}" y="${height - 8}" text-anchor="end">Reset</text><text x="${pad.left - 8}" y="${y(100)+4}" text-anchor="end">100%</text></svg>`;
+    const actual = history
+      .filter((entry) => {
+        const capturedAt = new Date(entry.capturedAt).getTime();
+        return Number.isFinite(entry.used) && capturedAt >= billingStart && capturedAt <= now;
+      })
+      .map((entry) => ({ time: new Date(entry.capturedAt).getTime(), used: entry.used }))
+      .sort((a, b) => a.time - b.time);
+    if (!actual.length || actual.at(-1).time !== now) actual.push({ time: now, used: latest.meters[name] });
+    const actualPath = actual.map((point, index) => `${index ? "L" : "M"}${x(point.time).toFixed(1)},${y(point.used).toFixed(1)}`).join(" ");
+    const dots = actual.map((point) => `<circle class="cqp-dot" cx="${x(point.time)}" cy="${y(point.used)}" r="3.5"><title>${new Date(point.time).toLocaleString()}: ${percent(point.used)}</title></circle>`).join("");
+    const projectionPath = `M${x(now).toFixed(1)},${y(latest.meters[name]).toFixed(1)} L${x(resetAt).toFixed(1)},${y(m.projected).toFixed(1)}`;
+    const formatDate = (time) => new Date(time).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    return `<svg class="cqp-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${name} usage history and projection for this billing period"><g class="cqp-grid"><path d="M${pad.left},${y(100)}H${width-pad.right} M${pad.left},${y(50)}H${width-pad.right} M${pad.left},${y(0)}H${width-pad.right}"/></g><path class="cqp-actual" d="${actualPath}"/><path class="cqp-projection ${m.projected > 100 ? "is-risk" : ""}" d="${projectionPath}"/>${dots}<text x="${pad.left}" y="${height - 8}">Start ${formatDate(billingStart)}</text><text x="${x(now)}" y="${height - 8}" text-anchor="middle">Today</text><text x="${width-pad.right}" y="${height - 8}" text-anchor="end">Reset ${formatDate(resetAt)}</text><text x="${pad.left - 8}" y="${y(100)+4}" text-anchor="end">100%</text></svg>`;
   }
 
   function createPanel(latest, store) {
@@ -91,11 +104,11 @@
     section.id = "cursor-quota-pace";
     const cards = latest ? Object.keys(latest.meters).map((name) => {
       const m = metrics(latest, name);
-      const history = (store.snapshots?.[name] || []).filter((entry) => entry.resetAt === latest.resetAt);
+      const history = store.snapshots?.[name] || [];
       const status = m.projected > 100 ? `Projected to exceed quota by ${percent(m.projected - 100)}` : m.onPace ? "On pace for reset" : "Above your daily pace";
       return `<article class="cqp-meter"><div class="cqp-meter-head"><div><h3>${name}</h3><p>${status}</p></div><strong class="${m.projected > 100 || !m.onPace ? "cqp-warning" : "cqp-good"}">${percent(m.used)} used</strong></div><div class="cqp-stats"><span><b>${percent(m.remainingDaily)}</b> / day remaining</span><span><b>${percent(m.daily)}</b> / day current pace</span><span><b>${percent(m.projected)}</b> projected</span></div>${graphSvg(latest, name, history)}</article>`;
     }).join("") : "";
-    section.innerHTML = `<div class="cqp-header"><div><p class="cqp-eyebrow">CURSORQUOTA</p><h2>Daily budget & reset projection</h2><p class="cqp-subtitle">${latest ? `${daysLabel(latest.daysLeft)} until reset · last updated ${new Date(latest.capturedAt).toLocaleString()}` : "Load your spending data to calculate a projection."}</p></div></div>${latest ? `<div class="cqp-legend"><span class="cqp-key actual"></span>Actual <span class="cqp-key ideal"></span>Ideal pace <span class="cqp-key projected"></span>Projected</div><div class="cqp-meters">${cards}</div>` : ""}`;
+    section.innerHTML = `<div class="cqp-header"><div><p class="cqp-eyebrow">CURSORQUOTA</p><h2>Daily budget & reset projection</h2><p class="cqp-subtitle">${latest ? `${daysLabel(latest.daysLeft)} until reset · last updated ${new Date(latest.capturedAt).toLocaleString()}` : "Load your spending data to calculate a projection."}</p></div></div>${latest ? `<div class="cqp-legend"><span class="cqp-key actual"></span>Usage at each visit <span class="cqp-key projected"></span>Projected through reset</div><div class="cqp-meters">${cards}</div>` : ""}`;
     return section;
   }
 
@@ -115,6 +128,7 @@
     if (activeRender) return;
     if (lastPath !== location.pathname) {
       lastPath = location.pathname;
+      if (lastPath === "/dashboard/spending") spendingVisitCaptured = false;
       document.getElementById("cursor-quota-pace")?.remove();
     }
     const render = location.pathname === "/dashboard/spending" ? renderSpending : null;
