@@ -1,6 +1,6 @@
 (() => {
   const STORAGE_KEY = "cursorQuotaPace";
-  const CYCLE_DAYS = 30;
+  const DAY_MS = 24 * 60 * 60 * 1000;
   let lastPath = "";
   let renderTimer;
   let activeRender = false;
@@ -20,6 +20,17 @@
   });
 
   const numberFromText = (text) => Number((text.match(/([\d.]+)%\s*used/i) || [])[1]);
+  function usageFromContainer(container) {
+    const bar = container?.querySelector(".relative.w-full.overflow-hidden > .absolute.inset-y-0.left-0");
+    let width = bar?.style.width.trim() || "";
+    const variable = width.match(/^var\(\s*(--[\w-]+)\s*\)$/);
+    if (variable) width = getComputedStyle(bar).getPropertyValue(variable[1]).trim();
+    // Read the declared percentage, not rendered pixels: min-width can make
+    // small usage values look larger than they are. Keep all supplied precision.
+    const match = width.match(/^(\d+(?:\.\d+)?|\.\d+)\s*%$/);
+    const used = match ? Number(match[1]) : NaN;
+    return Number.isFinite(used) ? used : numberFromText(container?.innerText || "");
+  }
   const daysFromText = (text) => {
     const match = text.match(/\(([^()]*?)\s+left\)/i);
     if (!match) return NaN;
@@ -27,14 +38,33 @@
     const parts = [...match[1].matchAll(/(\d+)\s+(day|hour|minute)s?/gi)];
     return parts.length ? parts.reduce((total, [, count, unit]) => total + Number(count) * unitDays[unit.toLowerCase()], 0) : NaN;
   };
-  const resetFromText = (text) => {
+  const resetFromText = (text, today = new Date()) => {
     const match = text.match(/reset on ([A-Z][a-z]{2}\s+\d{1,2})/i);
     if (!match) return null;
-    const today = new Date();
-    let reset = new Date(`${match[1]}, ${today.getFullYear()} 23:59:59`);
-    if (reset < today) reset.setFullYear(today.getFullYear() + 1);
+    // The page supplies a date, not a reset time. Use local midnight
+    // consistently for the estimated monthly cycle and its projection.
+    const reset = new Date(`${match[1]}, ${today.getFullYear()} 00:00:00`);
+    const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    if (reset < todayStart) reset.setFullYear(today.getFullYear() + 1);
+    if (!Number.isFinite(reset.getTime())) return null;
     return reset.toISOString();
   };
+
+  function billingPeriod(latest) {
+    const reset = new Date(latest.resetAt);
+    // Normalize older snapshots that stored an invented end-of-day time.
+    reset.setHours(0, 0, 0, 0);
+    const previousMonthEnd = new Date(reset.getFullYear(), reset.getMonth(), 0).getDate();
+    const start = new Date(reset.getFullYear(), reset.getMonth() - 1, Math.min(reset.getDate(), previousMonthEnd));
+    const now = new Date(latest.capturedAt).getTime();
+    const billingStart = start.getTime();
+    const resetAt = reset.getTime();
+    return {
+      now, billingStart, resetAt,
+      elapsedDays: Math.max(0, (now - billingStart) / DAY_MS),
+      remainingDays: Math.max(0, (resetAt - now) / DAY_MS)
+    };
+  }
 
   function parseSpending() {
     const text = document.body.innerText;
@@ -44,7 +74,7 @@
     for (const label of ["Cursor Models", "Other Models"]) {
       const labelNode = [...document.querySelectorAll("span")].find((node) => node.textContent.trim() === label);
       const container = labelNode?.closest(".flex.flex-col.gap-1\\.5") || labelNode?.parentElement?.parentElement;
-      const used = numberFromText(container?.innerText || "");
+      const used = usageFromContainer(container);
       if (Number.isFinite(used)) meters[label] = used;
     }
     return Number.isFinite(daysLeft) && resetAt && Object.keys(meters).length ? { daysLeft, resetAt, meters } : null;
@@ -56,7 +86,7 @@
     const store = await getStore();
     const now = new Date();
     const capturedAt = spendingVisitCaptured ? (store.latest?.capturedAt || now.toISOString()) : now.toISOString();
-    const oldestAllowed = now.getTime() - 30 * 24 * 60 * 60 * 1000;
+    const oldestAllowed = now.getTime() - 35 * DAY_MS;
     const snapshots = store.snapshots || {};
     for (const [name, used] of Object.entries(parsed.meters)) {
       const entries = (snapshots[name] || []).filter((entry) => new Date(entry.capturedAt).getTime() >= oldestAllowed);
@@ -69,38 +99,126 @@
   }
 
   const percent = (value) => `${Math.max(0, value).toFixed(1)}%`;
-  const daysLabel = (value) => `${Math.max(0, Math.ceil(value))} day${Math.ceil(value) === 1 ? "" : "s"}`;
+  const usagePercent = (value) => `${Math.max(0, value)}%`;
+  const decimalPlaces = (value) => {
+    const [coefficient, exponent = "0"] = String(value).split(/e/i);
+    return Math.max(0, (coefficient.split(".")[1]?.length || 0) - Number(exponent));
+  };
+  const quotaUnits = (value, places) => {
+    const [coefficient, exponent = "0"] = String(value).split(/e/i);
+    const fraction = coefficient.split(".")[1]?.length || 0;
+    return BigInt(coefficient.replace(".", "")) * 10n ** BigInt(places + Number(exponent) - fraction);
+  };
+  const quotaText = (units, places) => {
+    const digits = units.toString().padStart(places + 1, "0");
+    const fraction = digits.slice(-places).replace(/0+$/, "");
+    return `${digits.slice(0, -places)}${fraction ? `.${fraction}` : ""}`;
+  };
 
   function metrics(latest, name) {
     const used = latest.meters[name];
-    const elapsed = Math.max(1, CYCLE_DAYS - latest.daysLeft);
-    const daily = used / elapsed;
-    const projected = used + daily * latest.daysLeft;
-    const ideal = (elapsed / CYCLE_DAYS) * 100;
-    const remainingDaily = (100 - used) / Math.max(1, latest.daysLeft);
-    return { used, daily, projected, ideal, remainingDaily, onPace: used <= ideal };
+    const period = billingPeriod(latest);
+    const daily = period.elapsedDays > 0 ? used / period.elapsedDays : null;
+    const projected = daily === null ? null : used + daily * period.remainingDays;
+    const remainingDaily = period.remainingDays > 0 ? Math.max(0, 100 - used) / period.remainingDays : null;
+    return { used, daily, projected, remainingDaily, period };
   }
 
   function graphMarkup(latest, name, history) {
     const m = metrics(latest, name);
-    const now = new Date(latest.capturedAt).getTime();
-    const resetAt = Math.max(now + 1, new Date(latest.resetAt).getTime());
-    const billingStart = resetAt - CYCLE_DAYS * 24 * 60 * 60 * 1000;
+    const { now, resetAt, billingStart } = m.period;
     const actual = history
       .filter((entry) => {
         const capturedAt = new Date(entry.capturedAt).getTime();
-        return Number.isFinite(entry.used) && capturedAt >= billingStart && capturedAt <= now;
+        const entryReset = new Date(entry.resetAt);
+        entryReset.setHours(0, 0, 0, 0);
+        return Number.isFinite(entry.used) && capturedAt >= billingStart && capturedAt < now && entryReset.getTime() === resetAt;
       })
       .map((entry) => ({ time: new Date(entry.capturedAt).getTime(), used: entry.used }))
       .sort((a, b) => a.time - b.time);
-    if (!actual.length || actual.at(-1).time !== now) actual.push({ time: now, used: latest.meters[name] });
+    actual.push({ time: now, used: latest.meters[name] });
     const data = encodeURIComponent(JSON.stringify({ actual, now, resetAt, billingStart, projected: m.projected }));
-    return `<div class="cqp-chart" data-chart="${data}" role="img" aria-label="${name} usage history and projection for this billing period"><div class="cqp-y-label cqp-y-100">100%</div><div class="cqp-y-label cqp-y-50">50%</div><div class="cqp-plot"><i class="cqp-grid-line cqp-grid-100"></i><i class="cqp-grid-line cqp-grid-50"></i><i class="cqp-grid-line cqp-grid-0"></i><svg class="cqp-series" preserveAspectRatio="none" aria-hidden="true"><path class="cqp-line-actual" fill="none"></path><path class="cqp-line-projection" fill="none"></path></svg></div><div class="cqp-points"></div><div class="cqp-axis"><span class="cqp-axis-start"></span><span class="cqp-axis-today">Today</span><span class="cqp-axis-reset"></span></div><div class="cqp-tooltip" role="tooltip"></div></div>`;
+    return `<div class="cqp-chart" data-chart="${data}" role="img" aria-label="${name} usage history and estimated projection for this billing period"><div class="cqp-y-label cqp-y-max"></div><div class="cqp-y-label cqp-y-100">100%</div><div class="cqp-y-label cqp-y-50">50%</div><div class="cqp-plot"><i class="cqp-grid-line cqp-grid-100"></i><i class="cqp-grid-line cqp-grid-50"></i><i class="cqp-grid-line cqp-grid-0"></i><svg class="cqp-series" preserveAspectRatio="none" aria-hidden="true"><path class="cqp-line-actual" fill="none"></path><path class="cqp-line-projection" fill="none"></path></svg></div><div class="cqp-points"></div><div class="cqp-axis"><span class="cqp-axis-start"></span><span class="cqp-axis-reset"></span></div><div class="cqp-tooltip" role="tooltip"></div></div>`;
+  }
+
+  function dailyUsage(latest, name, history) {
+    const { now, billingStart, resetAt } = billingPeriod(latest);
+    const points = history.filter((entry) => {
+      const time = new Date(entry.capturedAt).getTime();
+      const reset = new Date(entry.resetAt);
+      reset.setHours(0, 0, 0, 0);
+      return Number.isFinite(entry.used) && entry.used >= 0 && time >= billingStart && time < now && reset.getTime() === resetAt;
+    }).map((entry) => ({ time: new Date(entry.capturedAt).getTime(), used: entry.used }));
+    if (!Number.isFinite(now) || now < billingStart || !Number.isFinite(latest.meters[name]) || latest.meters[name] < 0) return [];
+    points.push({ time: now, used: latest.meters[name] });
+    points.sort((a, b) => a.time - b.time);
+    // Prefer newer readings when old counters conflict with them. Never
+    // turn a correction or duplicate timestamp into negative daily usage.
+    const consistent = [];
+    for (let index = points.length - 1; index >= 0; index--) {
+      const next = consistent.at(-1);
+      if (!next || (points[index].time < next.time && points[index].used <= next.used)) consistent.push(points[index]);
+    }
+    consistent.reverse();
+    const places = Math.max(5, ...consistent.map((point) => decimalPlaces(point.used)));
+    const readings = [{ time: billingStart, used: 0, baseline: true }, ...consistent];
+    const days = new Map();
+    const dayStart = (time) => {
+      const date = new Date(time);
+      return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+    };
+    for (let index = 1; index < readings.length; index++) {
+      const first = readings[index - 1];
+      const last = readings[index];
+      const delta = quotaUnits(last.used, places) - quotaUnits(first.used, places);
+      const segments = [];
+      let cursor = first.time;
+      do {
+        const start = dayStart(cursor);
+        const midnight = new Date(start);
+        midnight.setDate(midnight.getDate() + 1);
+        const end = Math.min(last.time, midnight.getTime());
+        if (!days.has(start)) days.set(start, { start, observed: 0n, estimated: 0n });
+        segments.push({ day: days.get(start), duration: BigInt(end - cursor), units: 0n, remainder: 0n });
+        cursor = end;
+      } while (cursor < last.time);
+      const duration = BigInt(last.time - first.time);
+      let allocated = 0n;
+      for (const segment of segments) {
+        segment.units = duration ? delta * segment.duration / duration : delta;
+        segment.remainder = duration ? delta * segment.duration % duration : 0n;
+        allocated += segment.units;
+      }
+      // Largest remainders absorb rounding at the captured precision, so
+      // every interval and the displayed daily totals reconcile exactly.
+      const ranked = [...segments].sort((a, b) => a.remainder > b.remainder ? -1 : a.remainder < b.remainder ? 1 : 0);
+      for (let remainder = delta - allocated, i = 0; remainder > 0n; remainder--, i++) ranked[i].units++;
+      const measured = !first.baseline && segments.length === 1;
+      for (const segment of segments) segment.day[measured ? "observed" : "estimated"] += segment.units;
+    }
+    return [...days.values()].sort((a, b) => b.start - a.start).map((day) => ({
+      start: day.start,
+      used: quotaText(day.observed + day.estimated, places),
+      observed: quotaText(day.observed, places),
+      estimated: quotaText(day.estimated, places)
+    }));
+  }
+
+  function dailyUsageMarkup(latest, name, history) {
+    const days = dailyUsage(latest, name, history);
+    if (!days.length) return "";
+    const rows = days.map((day) => {
+      const date = new Date(day.start).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+      return `<li><span>${date}</span><b>${day.used}%</b></li>`;
+    }).join("");
+    return `<details class="cqp-daily"><summary>Daily usage · ${days[0].used}% on ${new Date(days[0].start).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</summary><ul>${rows}</ul></details>`;
   }
 
   function enableChartZoom(chart) {
     const data = JSON.parse(decodeURIComponent(chart.dataset.chart));
     const fullRange = data.resetAt - data.billingStart;
+    const maxUsage = Math.max(100, data.projected ?? 0, ...data.actual.map((point) => point.used));
+    const yMax = maxUsage <= 110 ? 120 : Math.ceil(maxUsage * 1.1 / 50) * 50;
     const minimumRange = Math.max(60 * 60 * 1000, fullRange / 8);
     let range = { start: data.billingStart, end: data.resetAt };
     const formatDate = (time) => new Date(time).toLocaleDateString(undefined, { month: "short", day: "numeric" });
@@ -148,11 +266,11 @@
       if (!width || !height) return;
       hideTooltip();
       const x = (time) => ((time - range.start) / (range.end - range.start)) * width;
-      const y = (used) => height - (Math.min(120, Math.max(0, used)) / 120) * height;
+      const y = (used) => height - (Math.max(0, used) / yMax) * height;
       const visible = data.actual.filter((point) => point.time >= range.start && point.time <= range.end);
       series.setAttribute("viewBox", `0 0 ${width} ${height}`);
       actualPath.setAttribute("d", data.actual.length > 1 ? pathFrom(data.actual.map((point) => ({ x: x(point.time), y: y(point.used) }))) : "");
-      const showProjection = data.resetAt >= range.start && data.now <= range.end;
+      const showProjection = data.projected !== null && data.resetAt >= range.start && data.now <= range.end;
       projectionPath.setAttribute("class", `cqp-line-projection${data.projected > 100 ? " is-risk" : ""}`);
       projectionPath.setAttribute("d", showProjection ? pathFrom([{ x: x(data.now), y: y(data.actual.at(-1).used) }, { x: x(data.resetAt), y: y(data.projected) }]) : "");
       points.replaceChildren();
@@ -161,18 +279,21 @@
         dot.className = "cqp-dom-dot";
         dot.style.left = `${x(point.time)}px`;
         dot.style.top = `${y(point.used)}px`;
-        const label = `${new Date(point.time).toLocaleString()}: ${percent(point.used)}`;
+        const label = `${new Date(point.time).toLocaleString()}: ${usagePercent(point.used)}`;
         dot.setAttribute("aria-label", label);
         dot.addEventListener("mouseenter", (event) => showTooltip(event, label));
         dot.addEventListener("mousemove", (event) => showTooltip(event, label));
         dot.addEventListener("mouseleave", hideTooltip);
         points.append(dot);
       });
-      chart.querySelector(".cqp-axis-start").textContent = `Start ${formatDate(range.start)}`;
-      chart.querySelector(".cqp-axis-today").style.left = `${x(data.now)}px`;
-      chart.querySelector(".cqp-axis-reset").textContent = `Reset ${formatDate(range.end)}`;
+      chart.querySelector(".cqp-axis-start").textContent = `${range.start === data.billingStart ? "Start " : ""}${formatDate(range.start)}`;
+      chart.querySelector(".cqp-axis-reset").textContent = `${range.end === data.resetAt ? "Reset " : ""}${formatDate(range.end)}`;
+      chart.querySelector(".cqp-y-max").textContent = `${yMax}%`;
+      chart.querySelector(".cqp-y-max").style.top = `${plot.offsetTop}px`;
       chart.querySelector(".cqp-y-100").style.top = `${plot.offsetTop + y(100)}px`;
       chart.querySelector(".cqp-y-50").style.top = `${plot.offsetTop + y(50)}px`;
+      chart.querySelector(".cqp-grid-100").style.top = `${y(100)}px`;
+      chart.querySelector(".cqp-grid-50").style.top = `${y(50)}px`;
     };
 
     chart.addEventListener("wheel", (event) => {
@@ -234,10 +355,11 @@
     const cards = latest ? Object.keys(latest.meters).map((name) => {
       const m = metrics(latest, name);
       const history = store.snapshots?.[name] || [];
-      const status = m.projected > 100 ? `Projected to exceed quota by ${percent(m.projected - 100)}` : m.onPace ? "On pace for reset" : "Above your daily pace";
-      return `<article class="cqp-meter"><div class="cqp-meter-head"><div><h3>${name}</h3><p>${status}</p></div><strong class="${m.projected > 100 || !m.onPace ? "cqp-warning" : "cqp-good"}">${percent(m.used)} used</strong></div><div class="cqp-stats"><span><b>${percent(m.remainingDaily)}</b> / day remaining</span><span><b>${percent(m.daily)}</b> / day current pace</span><span><b>${percent(m.projected)}</b> projected</span></div>${graphMarkup(latest, name, history)}</article>`;
+      const status = m.projected === null ? "Cycle average unavailable at reset" : m.projected > 100 ? `Estimated to exceed quota by ${percent(m.projected - 100)}` : "Within quota at this cycle's average";
+      const formatMetric = (value) => value === null ? "—" : percent(value);
+      return `<article class="cqp-meter"><div class="cqp-meter-head"><div><h3>${name}</h3><p>${status}</p></div><strong class="${m.projected > 100 || m.used > 100 ? "cqp-warning" : "cqp-good"}">${usagePercent(m.used)} used</strong></div><div class="cqp-stats"><span><b>${formatMetric(m.remainingDaily)}</b> / day budget left</span><span><b>${formatMetric(m.daily)}</b> / day cycle average</span><span><b>${formatMetric(m.projected)}</b> at reset (est.)</span></div>${dailyUsageMarkup(latest, name, history)}${graphMarkup(latest, name, history)}</article>`;
     }).join("") : "";
-    section.innerHTML = `<div class="cqp-header"><div><p class="cqp-eyebrow">CURSORQUOTA</p><h2>Daily budget & reset projection</h2><p class="cqp-subtitle">${latest ? `${daysLabel(latest.daysLeft)} until reset · last updated ${new Date(latest.capturedAt).toLocaleString()}` : "Load your spending data to calculate a projection."}</p></div></div>${latest ? `<div class="cqp-legend"><span class="cqp-key actual"></span>Usage at each visit <span class="cqp-key projected"></span>Projected through reset <span class="cqp-zoom-hint">Scroll to zoom · drag or shift-scroll to pan · double-click to reset</span></div><div class="cqp-meters">${cards}</div>` : ""}`;
+    section.innerHTML = `<div class="cqp-header"><div><p class="cqp-eyebrow">CURSORQUOTA</p><h2>Daily budget & reset projection</h2><p class="cqp-subtitle">${latest ? `Reset ${new Date(billingPeriod(latest).resetAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })} · last updated ${new Date(latest.capturedAt).toLocaleString()}` : "Load your spending data to calculate a projection."}</p><p class="cqp-subtitle">Estimates use the monthly cycle average. Reset time is assumed to be midnight.</p></div></div>${latest ? `<div class="cqp-legend"><span class="cqp-legend-item"><i class="cqp-key actual"></i>Usage at each visit</span><span class="cqp-legend-item"><i class="cqp-key projected"></i>Estimated through reset</span><span class="cqp-zoom-hint">Scroll to zoom · drag or shift-scroll to pan · double-click to reset</span></div><div class="cqp-meters">${cards}</div>` : ""}`;
     section.querySelectorAll(".cqp-chart").forEach(enableChartZoom);
     return section;
   }
